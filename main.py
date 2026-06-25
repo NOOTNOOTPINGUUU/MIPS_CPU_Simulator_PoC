@@ -16,23 +16,35 @@ class Registers:
             's0': 16, 's1': 17, 's2': 18, 's3': 19, 's4': 20, 's5': 21, 's6': 22, 's7': 23,
             't8': 24, 't9': 25, 'k0': 26, 'k1': 27, 'gp': 28, 'sp': 29, 'fp': 30, 'ra': 31
         }
-    def set_register_by_index(self, index, value):
+    def write_register(self, index, value):
         self._regs[index] = value
-    def set_register(self, name, value):
-        idx = self.name_map.get(name, 0)
-        self._regs[idx] = value
-    def get_register_by_index(self, index):
+    def read_register(self, index):
         return self._regs[index]
-    def get_register_by_name(self, name):
-        return self._regs[self.name_map.get(name, 0)]
     def dump(self):
         changed = {f"${name}": self._regs[idx] for name, idx in self.name_map.items()}
         return changed
+class Memory:
+    def __init__(self, size):
+        self.size = size
+        self.storage = {}
+    def read(self, address):
+        if address < 0 or address >= self.size:
+            raise Exception(f"OutOfBoundsError: Cannot read out of bounds memory{hex(address)}")
+        if address%4 != 0:
+            raise Exception(f"Alignment Error: Cannot read word from unaligned address {hex(address)}")
+        return self.storage.get(address, 0)
+    def write(self, address, value):
+        if address < 0 or address >= self.size:
+            raise Exception(f"OutOfBoundsError: Cannot write memory out of bounds{hex(address)}")
+        if address%4 != 0:
+            raise Exception(f"Alignment Error: Cannot write word to unaligned address {hex(address)}")
+        self.storage[address] = value& 0xFFFFFFFF
 class CPUCore:
     def __init__(self):
         self.registers = Registers()
+        self.alu = ALU()
         self.pc = 0x00400000
-        self.memory = [0] * (2**10) # 1KB of memory
+        self.memory = Memory(2**10)  # 1KB of memory
         self.overflow = 0
         self.exception = None
     def get_bits(self,val, start, end): #support function to extract bits from a value
@@ -43,25 +55,26 @@ class CPUCore:
         # IF
         bin_code = self.Instruction_Format(bin_code)
         # ID
-        # print(f"Executing instruction: {bin_code:032b}")
+        print(f"Executing instruction: {bin_code:032b}")
         # print(f"self.get_bits(bin_code, 0, 5): {self.get_bits(bin_code, 26, 31):06b}")
         control_signals = self.control_unit(self.get_bits(bin_code, 26, 31))
-        # print(f"bincode={bin_code[:6][::-1]}:{bin_code[6:11][::-1]}:{int(bin_code[11:16][::-1],2)}:{int(bin_code[16:21][::-1],2)}:{int(bin_code[21:26][::-1],2)}:{bin_code[26:]}")
-        rs = self.registers.get_register_by_index(self.get_bits(bin_code, 21, 25))
-        rt = self.registers.get_register_by_index(self.get_bits(bin_code, 16, 20))
+        rData1 = self.registers.read_register(self.get_bits(bin_code, 21, 25))
+        rData2 = self.registers.read_register(self.get_bits(bin_code, 16, 20))
         rd_index = self.get_bits(bin_code, 11, 15)
-        # print(f"rs({self.get_bits(bin_code, 21, 25)}): {rs}, rt({self.get_bits(bin_code, 16, 20)}): {rt}")
+        # print(f"rs({self.get_bits(bin_code, 21, 25)}): {rData1}, rt({self.get_bits(bin_code, 16, 20)}): {rData2}")
 
-        immt = self.get_bits(bin_code, 0, 15) #sign extend todo
+        immt = self.get_bits(bin_code, 0, 15)
+        sign_bit = (immt >> 15) & 1
+        for i in range(16): #signed extension 16-bit to 32-bit
+            immt |= sign_bit << i+16
         # print(f"imm: {immt}")
         # EX
         # print(control_signals["alu_src"])
         if control_signals["alu_src"]:  #alu_src multiplexor
-            rt = immt  # immediate value
+            rData2 = immt  # immediate value
             # print(f"ALUSrc is 1, using constant {op_b} as op_b")
         # print(self.get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
-        ALU_control_signals = self.ALU_control_unit(self.get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
-        alu_result, zero_flag = self.ALU_32(ALU_control_signals, rs, rt)
+        alu_result, zero_flag, self.overflow = self.alu.execute(rData1, rData2, self.get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
         # print(f"ALU result: {alu_result}, zero_flag: {zero_flag}")
         if self.overflow:
             print("Overflow occurred. Result not written to register.")
@@ -80,7 +93,7 @@ class CPUCore:
             regd = self.get_bits(bin_code, 16, 20)
         # print(f"Writing to register index {regd} with value {alu_result}")
         if control_signals["reg_write"]:
-            self.registers.set_register_by_index(regd, alu_result)
+            self.registers.write_register(regd, alu_result)
     def Instruction_Format(self, instruction):
 
         return instruction
@@ -118,17 +131,28 @@ class CPUCore:
         signals["mem_write"] = sw
         signals["branch"] = beq
         signals["ext_op"] = 0
-        signals["alu_op1"] = r_type or addi
-        signals["alu_op0"] = beq or addi
+        signals["alu_op1"] = r_type
+        signals["alu_op0"] = beq
         for key,value in signals.items():
             signals[key] = 1 if value else 0 # Formatting for clear looks <3
         # print(f"op: {op}")
         # print(f"r_type: {r_type}, lw: {lw}, sw: {sw}, beq: {beq}")
         # print(f"control_unit: {signals}")
         return signals
+class ALU:
+    def __init__(self):
+        self.exception = None
+        self.overflow = 0
+    def execute(self,rData1, rData2, func_code,alu_op1, alu_op0):
+        ALU_control_signals = self.ALU_control_unit(func_code, alu_op1, alu_op0)
+        # print(f"ALU control signals: {ALU_control_signals}")
+        alu_result, zero_flag, overflow = self.ALU_32(ALU_control_signals, rData1, rData2)
+        return alu_result, zero_flag, overflow
     def ALU_control_unit(self, func_code,alu_op1, alu_op0):
         # print(f"ALU_control_unit: func_code={func_code}, alu_op1={alu_op1}, alu_op0={alu_op0}")
         signals = [0] * 4 # [ainvert,binvert, op1, op0]
+        if alu_op1 == 0 and alu_op0 == 0:
+            signals[2] = 1 #add
         if alu_op1 ==1 and alu_op0 == 0:
             if func_code == 0b100100: #and
                 # do nothing, default is [0,0,0,0]
@@ -147,8 +171,6 @@ class CPUCore:
                 signals[1] = 1
                 signals[2] = 1
                 signals[3] = 1
-        if alu_op1 ==1 and alu_op0 == 1:
-            signals[2] = 1 #addi
         return signals
     def ALU_32(self, table, op_a, op_b):
         op_a = op_a & 0xFFFFFFFF
@@ -156,7 +178,6 @@ class CPUCore:
         result = 0x0
         carry_in = 0
         zero_flag = 0
-        WIDTH = 32
         for i in range(WIDTH):
             bit_a = (op_a >> i) & 1
             bit_b = (op_b >> i) & 1
@@ -176,7 +197,7 @@ class CPUCore:
             zero_flag = 1
         if overflow_flag:
             self.overflow = 1
-        return result & 0xFFFFFFFF, zero_flag
+        return result & 0xFFFFFFFF, zero_flag, self.overflow
         
     def ALU_01(self, table, op_a, op_b, carry_in): #table: [ainvert, binvert, op1, op0]
         carry_out = 0
@@ -243,10 +264,15 @@ class Compiler:
         print(f"bin_code after R-type: {bin_code:032b}")
         return bin_code
     def compile_i_type(self, cmd,bin_code, inst_type): #I-type[inst rt rs imm]
+        if cmd[2].find("(") != -1 and cmd[2].find(")") != -1: #lw/sw format: lw $t0, 4($t1)
+            cmd.insert(3, cmd[2].split("(")[0])
+            cmd[2] = cmd[2].split("(")[1].split(")")[0]
+        # print(f"cmd after parsing: {cmd}")
         if len(cmd) < 4:
             self.exception = "Invalid I-type instruction format"
             bin_code = self.nop
             return bin_code
+
         rt,rs,imm = 0,0,0
         try:
             rt = self.reg_table.name_map[cmd[1]]
@@ -314,7 +340,7 @@ def interface():
             break
         if cmd == "":
             continue
-        if cmd == "registers":
+        if cmd == "registers" or cmd == "regs":
             display = registers.dump()
             for i in range(0, len(display), 4):
                 
@@ -331,6 +357,7 @@ def interface():
             CPU.exception = None
             continue
         display = registers.dump()
+
         for i in range(0, len(display), 4):
             print(" ".join(f"{k}: {v}" for k, v in list(display.items())[i:i+4]))
 
