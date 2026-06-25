@@ -315,7 +315,7 @@ class Compiler:
         cmd = cmd.split("#")[0]  # Remove comments
         cmd = cmd.replace("$", "").replace(",", " ").replace("\t", " ").strip().split()
         if not cmd:
-            self.exception = "Empty command"
+            # self.exception = "Empty command"
             return self.nop
         print(f"Decoded command: {cmd}")
 
