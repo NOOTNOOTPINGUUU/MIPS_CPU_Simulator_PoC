@@ -24,17 +24,16 @@ class Registers:
         changed = {f"${name}": self._regs[idx] for name, idx in self.name_map.items()}
         return changed
 class Memory:
-    def __init__(self, size):
-        self.size = size
+    def __init__(self):
         self.storage = {}
     def read(self, address):
-        if address < 0 or address >= self.size:
+        if address < 0 or address >= 0xFFFFFFFF:
             raise Exception(f"OutOfBoundsError: Cannot read out of bounds memory{hex(address)}")
         if address%4 != 0:
             raise Exception(f"Alignment Error: Cannot read word from unaligned address {hex(address)}")
         return self.storage.get(address, 0)
     def write(self, address, value):
-        if address < 0 or address >= self.size:
+        if address < 0 or address >= 0xFFFFFFFF:
             raise Exception(f"OutOfBoundsError: Cannot write memory out of bounds{hex(address)}")
         if address%4 != 0:
             raise Exception(f"Alignment Error: Cannot write word to unaligned address {hex(address)}")
@@ -46,17 +45,18 @@ class CPUCore:
     def __init__(self):
         self.registers = Registers()
         self.alu = ALU()
-        self.pc = 0x00400000
-        self.memory = Memory(2**10)  # 1KB of memory
+        self.pc = 0x00400000 #Program_Counter
+        self.memory = Memory()
         self.overflow = 0
         self.exception = None
     def get_bits(self,val, start, end): #support function to extract bits from a value
         length = end - start + 1
         mask = (1 << length) - 1
         return (val >> start) & mask
-    def execute(self, bin_code):
+    def execute(self):
         # ===IF===
-        bin_code = self.Instruction_Format(bin_code)
+        bin_code = self.Instruction_MEM(self.pc)
+        pc = self.pc + 4
         # ===ID===
         print(f"Executing instruction: {bin_code:032b}")
         # print(f"self.get_bits(bin_code, 0, 5): {self.get_bits(bin_code, 26, 31):06b}")
@@ -103,8 +103,9 @@ class CPUCore:
         # print(f"Writing to register index {regd} with value {result}")
         if control_signals["reg_write"]:
             self.registers.write_register(regd, result)
-    def Instruction_Format(self, instruction):
-
+        self.pc = pc
+    def Instruction_MEM(self, address):
+        instruction = self.memory.read(address)
         return instruction
     def control_unit(self, opcode):
         signals ={
@@ -235,8 +236,8 @@ class ALU:
         else:
             self.exception = "Invalid ALU operation"
 class Compiler:
-    def __init__(self):
-        self.reg_table = Registers()
+    def __init__(self, registers):
+        self.reg_table = registers
         self.exception = None
         self.nop = 0
         self.inst_map = {
@@ -253,7 +254,7 @@ class Compiler:
             'sw':   (0b101011, 0b000000, 'I'),
             'beq':  (0b000100, 0b000000, 'I'),
         }
-    def compile_r_type(self, cmd,bin_code,func_code, inst_type): #R-type[inst rd rs rt/shamt]
+    def compile_r_type(self, cmd,bin_code,func_code): #R-type[inst rd rs rt/shamt]
         if len(cmd) < 4:
             self.exception = "Invalid R-type instruction format"
             bin_code = self.nop
@@ -276,15 +277,15 @@ class Compiler:
         bin_code |= rd << 11
         bin_code |= shamt << 6
         bin_code |= func_code
-        print(f"bin_code after R-type: {bin_code:032b}")
+        # print(f"bin_code after R-type: {bin_code:032b}")
         return bin_code
-    def compile_i_type(self, cmd,bin_code, inst_type): #I-type[inst rt rs imm]
+    def compile_i_type(self, cmd,bin_code): #I-type[inst rt rs imm]
         if cmd[2].find("(") != -1 and cmd[2].find(")") != -1: #lw/sw format: lw $t0, 4($t1)
             cmd.insert(3, cmd[2].split("(")[0])
             cmd[2] = cmd[2].split("(")[1].split(")")[0]
         # print(f"cmd after parsing: {cmd}")
         if len(cmd) < 4:
-            self.exception = "Invalid I-type instruction format"
+            self.exception = "Invalid I-type instruction format: Not enough arguments"
             bin_code = self.nop
             return bin_code
 
@@ -295,10 +296,14 @@ class Compiler:
             try:
                 imm = int(cmd[3]) & 0xFFFF
             except ValueError:
-                imm = 0
-                rt = self.reg_table.name_map[cmd[3]]
+                try:
+                    imm = int(cmd[3], 16) & 0xFFFF
+                except ValueError:
+                    imm = 0
+                    print(f"Invalid immediate value: {cmd[3]}. Defaulting to 0.")
+                    rt = self.reg_table.name_map[cmd[3]]
         except KeyError:
-            self.exception = "Invalid I-type instruction format"
+            self.exception = "Invalid I-type instruction format: Invalid register name"
             bin_code = self.nop
             return bin_code
         bin_code |= rs << 21
@@ -307,7 +312,11 @@ class Compiler:
         # print(f"bin_code after I-type: {bin_code:032b}")
         return bin_code
     def compile(self, cmd):
+        cmd = cmd.split("#")[0]  # Remove comments
         cmd = cmd.replace("$", "").replace(",", " ").replace("\t", " ").strip().split()
+        if not cmd:
+            self.exception = "Empty command"
+            return self.nop
         print(f"Decoded command: {cmd}")
 
         bin_code = 0
@@ -329,20 +338,72 @@ class Compiler:
         # print(f"Opcode: {opcode:06b}, Function code: {func_code:06b}, Instruction type: {inst_type}")
         match  inst_type:
             case 'R': 
-                bin_code = self.compile_r_type(cmd, bin_code,func_code, inst_type)
+                bin_code = self.compile_r_type(cmd, bin_code,func_code)
             case 'I':
-                bin_code = self.compile_i_type(cmd, bin_code, inst_type)
+                bin_code = self.compile_i_type(cmd, bin_code)
             case _:
                 self.exception = "Invalid instruction type"
                 bin_code = self.nop
         return bin_code
 
-
-        
+class Loader:
+    def __init__(self, CPU):
+        self.CPU = CPU
+        self.registers = CPU.registers
+        self.memory = CPU.memory
+        self.SP = 0x7FFFFFFC
+        self.GP = 0x10008000
+        self.PC = 0x00400000
+    def load_program(self, program):
+        self.registers.write_register(self.registers.name_map['sp'], self.SP)
+        self.registers.write_register(self.registers.name_map['gp'], self.GP)
+        self.CPU.pc = self.PC
+        for i, instruction in enumerate(program):
+            address = self.PC + i * 4
+            self.memory.write(address, instruction)
 def interface():
     CPU = CPUCore()
-    Compiler_32 = Compiler()
     registers = CPU.registers
+    compiler_32 = Compiler(registers)
+    loader = Loader(CPU)
+    code = """
+        addi $t0, $zero, 5
+        addi $t1, $zero, 3
+        add $t2, $t0, $t1
+        sw $t2, 0($zero)
+        lw $t3, 0($zero)
+    """
+    code = """
+addi $s0, $zero, 0x1234 # $s0 = 0x1234
+addi $s1, $zero, 0x5678 # $s1 = 0x5678
+sw   $s0, 4($zero)      # 將 0x1234 存入 Memory[4]
+sw   $s1, 8($zero)      # 將 0x5678 存入 Memory[8]
+lw   $s2, 4($zero)      # 從 Memory[4] 讀出到 $s2
+lw   $s3, 8($zero)      # 從 Memory[8] 讀出到 $s3
+
+"""
+    code = """
+addi $s0, $zero, 1     # F(1) = 1
+addi $s1, $zero, 1     # F(2) = 1
+addi $sp, $zero, 100   # 設定記憶體起始寫入位址 = 100
+
+sw   $s0, 0($sp)       # Memory[100] = 1
+sw   $s1, 4($sp)       # Memory[104] = 1
+
+# 計算 F(3)
+add  $s2, $s0, $s1     # $s2 = 1 + 1 = 2
+sw   $s2, 8($sp)       # Memory[108] = 2
+
+# 計算 F(4)
+add  $s0, $s1, $s2     # $s0 = 1 + 2 = 3
+sw   $s0, 12($sp)      # Memory[112] = 3
+
+# 計算 F(5)
+add  $s1, $s2, $s0     # $s1 = 2 + 3 = 5
+sw   $s1, 16($sp)      # Memory[116] = 5
+"""
+
+    program = []
     print("Welcome to the command line interface. Type 'exit' to quit.")
     while (True):
         try:
@@ -361,17 +422,26 @@ def interface():
                 
                 print(" ".join(f"{k}: {v:032b}" for k, v in list(display.items())[i:i+4]))
             continue
-        machine_code = Compiler_32.compile(cmd)
-        if Compiler_32.exception:
-            print(f"Error: {Compiler_32.exception}")
-            Compiler_32.exception = None
+        for i in range(0, len(code.splitlines())):
+            line = code.splitlines()[i]
+            if line.strip() == "":
+                continue
+            # print(f"Compiling instruction {i}: {line}")
+            machine_code = compiler_32.compile(line)
+            program.append(machine_code)
+        if compiler_32.exception:
+            print(f"Error: {compiler_32.exception}")
+            compiler_32.exception = None
             continue
-        CPU.execute(machine_code)
-        if CPU.exception:
-            print(f"Error: {CPU.exception}")
-            CPU.exception = None
-            continue
-        display = registers.dump()
+        loader.load_program(program)
+        for i in range(len(program)):
+            print(f"Instruction {i}: {program[i]:032b}")
+            CPU.execute()
+            if CPU.exception:
+                print(f"Error: {CPU.exception}")
+                CPU.exception = None
+                continue
+            display = registers.dump()
 
         for i in range(0, len(display), 4):
             print(" ".join(f"{k}: {v}" for k, v in list(display.items())[i:i+4]))
