@@ -376,29 +376,29 @@ def interface():
     code = """
 addi $s0, $zero, 0x1234 # $s0 = 0x1234
 addi $s1, $zero, 0x5678 # $s1 = 0x5678
-sw   $s0, 4($zero)      # 將 0x1234 存入 Memory[4]
-sw   $s1, 8($zero)      # 將 0x5678 存入 Memory[8]
-lw   $s2, 4($zero)      # 從 Memory[4] 讀出到 $s2
-lw   $s3, 8($zero)      # 從 Memory[8] 讀出到 $s3
+sw   $s0, 4($zero)      # write 0x1234 to Memory[4]
+sw   $s1, 8($zero)      # write 0x5678 to Memory[8]
+lw   $s2, 4($zero)      # read from Memory[4] to $s2
+lw   $s3, 8($zero)      # read from Memory[8] to $s3
 
 """
     code = """
 addi $s0, $zero, 1     # F(1) = 1
 addi $s1, $zero, 1     # F(2) = 1
-addi $sp, $zero, 100   # 設定記憶體起始寫入位址 = 100
+addi $sp, $zero, 100   # push stack pointer to 100
 
 sw   $s0, 0($sp)       # Memory[100] = 1
 sw   $s1, 4($sp)       # Memory[104] = 1
 
-# 計算 F(3)
+# Calculate F(3)
 add  $s2, $s0, $s1     # $s2 = 1 + 1 = 2
 sw   $s2, 8($sp)       # Memory[108] = 2
 
-# 計算 F(4)
+# Calculate F(4)
 add  $s0, $s1, $s2     # $s0 = 1 + 2 = 3
 sw   $s0, 12($sp)      # Memory[112] = 3
 
-# 計算 F(5)
+# Calculate F(5)
 add  $s1, $s2, $s0     # $s1 = 2 + 3 = 5
 sw   $s1, 16($sp)      # Memory[116] = 5
 """
