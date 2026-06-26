@@ -1,4 +1,9 @@
 WIDTH = 32
+def get_bits(val, start, end): #support function to extract bits from a value
+    length = end - start + 1
+    mask = (1 << length) - 1
+    return (val >> start) & mask
+
 class ZeroTouchGround(list):
     def __setitem__(self, key, value):
         super().__setitem__(key, value)
@@ -27,27 +32,19 @@ class Memory:
     def __init__(self):
         self.storage = {}
     def read(self, address):
-        self.exit_handle(address)
-        if address < 0 or address >= 0xFFFFFFFF:
-            raise Exception(f"OutOfBoundsError: Cannot read out of bounds memory{hex(address)}")
-        if address%4 != 0:
-            raise Exception(f"Alignment Error: Cannot read word from unaligned address {hex(address)}")
+        # if address < 0 or address >= 0xFFFFFFFF:
+        #     raise Exception(f"OutOfBoundsError: Cannot read out of bounds memory{hex(address)}")
+        # if address%4 != 0:
+        #     raise Exception(f"Alignment Error: Cannot read word from unaligned address {hex(address)}")
         return self.storage.get(address, 0)
     def write(self, address, value):
-        if address < 0 or address >= 0xFFFFFFFF:
-            raise Exception(f"OutOfBoundsError: Cannot write memory out of bounds{hex(address)}")
-        if address%4 != 0:
-            raise Exception(f"Alignment Error: Cannot write word to unaligned address {hex(address)}")
+        # if address < 0 or address >= 0xFFFFFFFF:
+        #     raise Exception(f"OutOfBoundsError: Cannot write memory out of bounds{hex(address)}")
+        # if address%4 != 0:
+        #     raise Exception(f"Alignment Error: Cannot write word to unaligned address {hex(address)}")
         # print(f"Writing value {value} to address {hex(address)}")
         self.storage[address] = value& 0xFFFFFFFF
         # print(self.storage)
-    def exit_handle(self, address):
-        if address == 0x80000180:
-            print("Exception")
-            display = self.dump()
-            for i in range(0, len(display), 4):
-                print(" ".join(f"{k}: {bin(v)}" for k, v in list(display.items())[i:i+4]))
-            exit(0)
     def dump(self):
         changed = {f"M[{hex(k)}]": v for k, v in self.storage.items()}
         return changed
@@ -61,16 +58,23 @@ class CP0:
             'EPC': 14
         }
     def write_register(self, index, value):
+        EXL = get_bits(self.read_register(self.name_map['Status']), 1, 1)
+        if index == self.name_map['EPC'] and EXL:
+            return
         self._regs[index] = value
     def read_register(self, index):
         return self._regs[index]
     def to_user_mode(self):
         self.write_register(self.name_map['Status'], (self._regs[self.name_map['Status']] & ~0b10010) | 0b10000)
     def to_exception_mode(self):
-        self.write_register(self.name_map['Status'], (self._regs[self.name_map['Status']] & ~0b10010) | 0b10010)
+        self.write_register(self.name_map['Status'], (self._regs[self.name_map['Status']] & ~0b10) | 0b10)
+    def eret(self):
+        self.write_register(self.name_map['Status'], (self._regs[self.name_map['Status']] & ~0b10) | 0b00)
     def dump(self):
         changed = {f"{name}": self._regs[idx] for name, idx in self.name_map.items()}
         return changed
+
+
 class CPUCore:
     def __init__(self):
         self.registers = Registers()
@@ -85,41 +89,38 @@ class CPUCore:
         self.exception = None
         self.EV_ADDRESS = 0x80000180 # Exception Vector Address
         self.cp0.to_user_mode()
-    def get_bits(self,val, start, end): #support function to extract bits from a value
-        length = end - start + 1
-        mask = (1 << length) - 1
-        return (val >> start) & mask
+
     def execute(self):
         # ===IF===
         bin_code = self.Instruction_MEM(self.pc)
-        EXL = self.get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 1, 1)
-        UM = self.get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 4, 4)
-        EX_CODE = self.get_bits(self.cp0.read_register(self.cp0.name_map['Cause']), 2, 6)
+        EXL = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 1, 1)
+        UM = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 4, 4)
+        EX_CODE = get_bits(self.cp0.read_register(self.cp0.name_map['Cause']), 2, 6)
         pc = self.pc + 4
         print(f"EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
         # ===ID===
         print(f"Executing instruction: {bin_code:032b}")
 
 
-        # print(f"self.get_bits(bin_code, 0, 5): {self.get_bits(bin_code, 26, 31):06b}")
-        control_signals = self.control_unit(self.get_bits(bin_code, 26, 31))
-        if self.get_bits(bin_code, 26, 31) == 0 and self.get_bits(bin_code, 0, 5) == 0b001100:
-            print(f"Exit by syscall")
-            display = self.registers.dump()
-            for i in range(0, len(display), 4):
-                print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
+        # print(f"get_bits(bin_code, 0, 5): {get_bits(bin_code, 26, 31):06b}")
+        control_signals = self.control_unit(get_bits(bin_code, 26, 31))
+        if get_bits(bin_code, 26, 31) == 0 and get_bits(bin_code, 0, 5) == 0b001100:
+            print(f"Syscall detected")
+            # display = self.registers.dump()
+            # for i in range(0, len(display), 4):
+            #     print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
             EXL = 1
-            EX_CODE = 8
+            EX_CODE = 0x08
             control_signals["reg_write"] = 0
             control_signals["mem_write"] = 0
             pc = self.EV_ADDRESS
             print(f"EXL: {EXL}, EX_CODE: {EX_CODE}, pc: {hex(pc)}")
-        rData1 = self.registers.read_register(self.get_bits(bin_code, 21, 25))
-        rData2 = self.registers.read_register(self.get_bits(bin_code, 16, 20))
-        rd_index = self.get_bits(bin_code, 11, 15)
-        # print(f"rs({self.get_bits(bin_code, 21, 25)}): {rData1}, rt({self.get_bits(bin_code, 16, 20)}): {rData2}")
+        rData1 = self.registers.read_register(get_bits(bin_code, 21, 25))
+        rData2 = self.registers.read_register(get_bits(bin_code, 16, 20))
+        rd_index = get_bits(bin_code, 11, 15)
+        # print(f"rs({get_bits(bin_code, 21, 25)}): {rData1}, rt({get_bits(bin_code, 16, 20)}): {rData2}")
 
-        immt = self.get_bits(bin_code, 0, 15)
+        immt = get_bits(bin_code, 0, 15)
         sign_bit = (immt >> 15) & 1
         for i in range(16): #signed extension 16-bit to 32-bit
             immt |= sign_bit << i+16
@@ -134,8 +135,8 @@ class CPUCore:
         if control_signals["alu_src"]:  #alu_src multiplexor
             alu_input = immt  # immediate value
             # print(f"ALUSrc is 1, using constant {op_b} as op_b")
-        # print(f"rData1: {rData1}, rData2: {rData2},alu_input: {alu_input}, opcode: {self.get_bits(bin_code, 0, 5)}, alu_op1: {control_signals['alu_op1']}, alu_op0: {control_signals['alu_op0']}")
-        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, self.get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
+        # print(f"rData1: {rData1}, rData2: {rData2},alu_input: {alu_input}, opcode: {get_bits(bin_code, 0, 5)}, alu_op1: {control_signals['alu_op1']}, alu_op0: {control_signals['alu_op0']}")
+        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
         # print(f"ALU result: {result}, zero_flag: {zero_flag}")
 
         # ===MEM===
@@ -144,7 +145,7 @@ class CPUCore:
             control_signals["reg_write"] = 0
             control_signals["mem_write"] = 0
             self.overflow = 0  # Reset overflow flag after handling
-            EX_CODE = 12
+            EX_CODE = 0x0C
             pc = self.EV_ADDRESS
             EXL = 1
 
@@ -173,13 +174,15 @@ class CPUCore:
         if control_signals["reg_dst"]:
             regd = rd_index
         else:
-            regd = self.get_bits(bin_code, 16, 20)
+            regd = get_bits(bin_code, 16, 20)
         # print(f"Writing to register index {regd} with value {result}")
         if control_signals["reg_write"]:
             self.registers.write_register(regd, result)
         self.cp0.write_register(self.cp0.name_map['Cause'], EX_CODE<<2) 
         if EXL:
+            self.cp0.write_register(self.cp0.name_map['EPC'], self.pc)
             self.cp0.to_exception_mode()
+        
         self.pc = pc
     def Instruction_MEM(self, address):
         instruction = self.memory.read(address)
@@ -228,12 +231,12 @@ class CPUCore:
         return signals
     def Data_Memory(self, address, write_data, mem_read, mem_write, EXL, UM):
         is_Kernal = (not UM) or EXL
-        if not is_Kernal and self.get_bits(address, 31, 31) == 1:
+        if not is_Kernal and get_bits(address, 31, 31) == 1:
             print(f"Address Error on Load/Store: {hex(address)} is out of range") #0x04 AdEL illegal memory access
-            return 0 ,1, 4
+            return 0 ,1, 0x04
         if address & 0x00000003 != 0:
             print(f"Address Error on Load/Store: {hex(address)} must be word-aligned") #0x05 AdES misaligned memory
-            return 0 ,1, 5
+            return 0 ,1, 0x05
 
         if mem_read:
             return self.memory.read(address) ,0, 0
@@ -451,15 +454,52 @@ class Loader:
         for i, instruction in enumerate(program):
             address = self.PC + i * 4
             self.memory.write(address, instruction)
-        self.memory.write(address+4, 0x0000000C)
+        self.memory.write(address+4, 0b00100000000000100000000000001010)
+        self.memory.write(address+8, 0x0000000C)
     def exception_loader(self):
         pass
+class SimpleOS:
+    def __init__(self, CPU):
+        self.CPU = CPU
+        self.cause_map = {
+            0x04: "Address error (load)",
+            0x05: "Address error (store)",
+            0x08: "Syscall",
+            0x0C: "Overflow",
+        }
+    def run(self):
+        while True:
+            self.CPU.execute()
+            if self.CPU.pc == self.CPU.EV_ADDRESS:
+                if self.exception_handler():
+                    continue
+                else:
+                    break
+    def exception_handler(self):
+        Cause = self.CPU.cp0.read_register(self.CPU.cp0.name_map['Cause'])
+        Status = self.CPU.cp0.read_register(self.CPU.cp0.name_map['Status'])
+
+        print(f"Cause: {Cause:032b}")
+        print(f"Status: {Status:032b}")
+        EX_CODE = (Cause >> 2) & 0x1F
+        print(f"Exception Code: {hex(EX_CODE)}")
+        print(f"Exception Type: {self.cause_map.get(EX_CODE, 'Unknown')}")
+        if EX_CODE == 0x08:
+            print(f"v0: {self.CPU.registers.read_register(self.CPU.registers.name_map['v0']):#010x}")
+            if self.CPU.registers.read_register(self.CPU.registers.name_map['v0']) == 10: 
+                print("exit!")
+                return 0
+            self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC']) + 4
+            self.CPU.cp0.eret()
+            return 1
+        return 0
 
 def interface():
     CPU = CPUCore()
     registers = CPU.registers
     compiler_32 = Compiler(registers)
     loader = Loader(CPU)
+    OS = SimpleOS(CPU)
     code = """
         addi $t0, $zero, 5
         addi $t1, $zero, 3
@@ -520,6 +560,9 @@ add  $s1, $s2, $s0     # $s1 = 2 + 3 = 5
 sw   $s1, 16($sp)      # Memory[116] = 5
 """
     code = """
+syscall
+syscall
+syscall
 addi $t0, $zero, 5
 addi $t1, $zero, 5
 beq  $t0, $t1, 2     # should jump to 999 if $t0 == $t1
@@ -544,7 +587,12 @@ addi $t2, $zero, 999   # this instruction should be executed if branch is taken
             display = registers.dump()
             for i in range(0, len(display), 4):
                 
-                print(" ".join(f"{k}: {v:032b}" for k, v in list(display.items())[i:i+4]))
+                print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
+            continue
+        if cmd == "memory" or cmd == "mem":
+            display = CPU.memory.dump()
+            for i in range(0, len(display), 4):
+                print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
             continue
         for i in range(0, len(code.splitlines())):
             line = code.splitlines()[i]
@@ -558,12 +606,7 @@ addi $t2, $zero, 999   # this instruction should be executed if branch is taken
             compiler_32.exception = None
             continue
         loader.load_program(program)
-        while True:
-            CPU.execute()
-            if CPU.exception:
-                print(f"Error: {CPU.exception}")
-                CPU.exception = None
-                break
+        OS.run()
 
 
 

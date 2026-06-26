@@ -3,7 +3,7 @@ A MIPS32 CPU Simulator implemented in Python. This project simulates the core ha
 
 ## Goal
 - Approaching hardware-level MIPS32 architecture
-- Implement basic Loader and Compiler/Assembler concepts.
+- Implement basic Loader and Compiler/Assembler and Exception Handling concepts.
 - Practice Object-Oriented Programming (OOP) in hardware design.
 
 ## Supported Instructions
