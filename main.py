@@ -31,19 +31,31 @@ class Registers:
 class Memory:
     def __init__(self):
         self.storage = {}
+        self.dump_storage = {}
+    def read_byte(self, address):
+        return self.storage.get(address, 0)&0xFF
     def read(self, address):
+        byte_value = 0
+        # byte_value = self.storage.get(address, 0)&0xFFFFFFFF
         # if address < 0 or address >= 0xFFFFFFFF:
         #     raise Exception(f"OutOfBoundsError: Cannot read out of bounds memory{hex(address)}")
         # if address%4 != 0:
         #     raise Exception(f"Alignment Error: Cannot read word from unaligned address {hex(address)}")
-        return self.storage.get(address, 0)
+        for i in range(4):
+            byte_value |= (self.read_byte(address + 3 - i) << ((3 - i) * 8))
+            # print(f"Reading byte {hex(self.storage.get(address + 3-i, 0)&0xFF)} from address {hex(address + 3-i)}")
+        # print(f"Reading value {hex(byte_value)} from address {hex(address)}")
+        return byte_value
     def write(self, address, value):
         # if address < 0 or address >= 0xFFFFFFFF:
         #     raise Exception(f"OutOfBoundsError: Cannot write memory out of bounds{hex(address)}")
         # if address%4 != 0:
         #     raise Exception(f"Alignment Error: Cannot write word to unaligned address {hex(address)}")
         # print(f"Writing value {value} to address {hex(address)}")
-        self.storage[address] = value& 0xFFFFFFFF
+        for i in range(4):
+            byte_value = (value >> (i * 8))& 0xFF
+            self.storage[address + i] = byte_value
+        self.dump_storage[address] = value& 0xFFFFFFFF
         # print(self.storage)
     def dump(self):
         changed = {f"M[{hex(k)}]": v for k, v in self.storage.items()}
@@ -100,15 +112,16 @@ class CPUCore:
         print(f"PC: {hex(self.pc)}, Instruction: {bin_code:032b}, EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
         # print(f"EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
         # ===ID===
-        print(f"Executing instruction: {bin_code:032b}")
+        # print(f"Executing instruction: {bin_code:032b}")
         jAddress = get_bits(bin_code, 0, 25)
         jAddress = jAddress << 2
         jAddress = (get_bits(self.pc, 28, 31) << 28) | jAddress
 
         # print(f"get_bits(bin_code, 0, 5): {get_bits(bin_code, 26, 31):06b}")
         control_signals = self.control_unit(get_bits(bin_code, 26, 31))
+        # print(f"Control signals: {control_signals}")
         if get_bits(bin_code, 26, 31) == 0 and get_bits(bin_code, 0, 5) == 0b001100:
-            print(f"Syscall detected")
+            # print(f"Syscall detected")
             # display = self.registers.dump()
             # for i in range(0, len(display), 4):
             #     print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
@@ -124,9 +137,12 @@ class CPUCore:
 
         immt = get_bits(bin_code, 0, 15)
         sign_bit = (immt >> 15) & 1
-        for i in range(16): #signed extension 16-bit to 32-bit
-            immt |= sign_bit << i+16
-        print(f"imm: {immt}")
+        if control_signals["sign_ext"]:
+            if sign_bit == 1:
+                immt |= 0xFFFF0000 #sign extend
+            else:
+                immt &= 0x0000FFFF #zero extend
+        # print(f"imm: {immt}")
         # ===EX===
 
         branch_address = immt << 2
@@ -137,8 +153,8 @@ class CPUCore:
         if control_signals["alu_src"]:  #alu_src multiplexor
             alu_input = immt  # immediate value
             # print(f"ALUSrc is 1, using constant {op_b} as op_b")
-        # print(f"rData1: {rData1}, rData2: {rData2},alu_input: {alu_input}, opcode: {get_bits(bin_code, 0, 5)}, alu_op1: {control_signals['alu_op1']}, alu_op0: {control_signals['alu_op0']}")
-        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, get_bits(bin_code, 0, 5), control_signals["alu_op1"], control_signals["alu_op0"])
+        # print(f"rData1: {rData1}, rData2: {rData2},alu_input: {alu_input}, opcode: {get_bits(bin_code, 0, 5)}, control_signals: {control_signals}")
+        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, get_bits(bin_code, 0, 5), control_signals["alu_op"])
         # print(f"ALU result: {result}, zero_flag: {zero_flag}")
 
         # ===MEM===
@@ -152,7 +168,7 @@ class CPUCore:
 
         if control_signals["branch"] and zero_flag:
             pc = branch_address
-            print(f"Branch taken to address {hex(pc)}, originally {hex(self.pc)}")
+            # print(f"Branch taken to address {hex(pc)}, originally {hex(self.pc)}")
         rMData = 0
         if control_signals["jump"]:
             pc = jAddress
@@ -200,38 +216,49 @@ class CPUCore:
             "mem_read": 0,
             "mem_write": 0,
             "branch": 0,
-            "ext_op": 0,
-            "alu_op1": 0,
-            "alu_op0": 0,
+            "sign_ext": 0,
+            "alu_op": 0,
             "jump": 0
         }
         op = []
         for i in range(6):
             op.append(opcode & (1<<5-i))
-        r_type, lw, sw, beq, addi = 0,0,0,0,0
+        r_type, lw, sw, beq, addi,lui = 0,0,0,0,0,0
         r_type = (not op[5]) and (not op[4]) and (not op[3]) and (not op[2]) and (not op[1]) and (not op[0]) #000000
         lw = op[5] and op[4] and (not op[3]) and (not op[2]) and (not op[1]) and op[0] #100011
         sw = op[5] and op[4] and (not op[3]) and op[2] and (not op[1]) and op[0] #101011
         beq = (not op[5]) and (not op[4]) and op[3] and (not op[2]) and (not op[1]) and (not op[0]) #000100
         j = (not op[5]) and op[4] and (not op[3]) and (not op[2]) and (not op[1]) and (not op[0]) #000010
+        lui = op[5] and  op[4] and  op[3] and op[2] and (not op[1]) and (not op[0]) #001111
         addi = (not op[5]) and (not op[4]) and (not op[3]) and op[2] and (not op[1]) and (not op[0]) #00100
+        ori = op[5] and (not op[4]) and op[3] and op[2] and (not op[1]) and (not op[0]) #001101
         # r_type = bool(r_type)
         # lw = bool(lw)
         # sw = bool(sw)
         # beq = bool(beq)
         signals["reg_dst"] = r_type
-        signals["alu_src"] = (lw or sw or addi)
+        signals["alu_src"] = (lw or sw or addi or lui or ori)
         signals["mem_to_reg"] = lw
-        signals["reg_write"] = (r_type or lw or addi)
+        signals["reg_write"] = (r_type or lw or addi or lui or ori)
         signals["mem_read"] = lw
         signals["mem_write"] = sw
         signals["branch"] = beq
-        signals["ext_op"] = 0
-        signals["alu_op1"] = r_type
-        signals["alu_op0"] = beq
         signals["jump"] = j
+        signals["sign_ext"] = lw or sw or beq or addi
+        
         for key,value in signals.items():
             signals[key] = 1 if value else 0 # Formatting for clear looks <3
+        alu_3bits = 0
+        if r_type:
+            alu_3bits |= 0b010
+        elif beq:
+            alu_3bits |= 0b001
+        elif lui:
+            alu_3bits |= 0b011
+        elif ori:
+            alu_3bits |= 0b100
+        signals["alu_op"] = alu_3bits
+
         # print(f"op: {op}")
         # print(f"r_type: {r_type}, lw: {lw}, sw: {sw}, beq: {beq}")
         # print(f"control_unit: {signals}")
@@ -254,37 +281,31 @@ class ALU:
     def __init__(self):
         self.exception = None
         self.overflow = 0
-    def execute(self,rData1, rData2, func_code,alu_op1, alu_op0):
-        ALU_control_signals = self.ALU_control_unit(func_code, alu_op1, alu_op0)
+    def execute(self,rData1, rData2, func_code,alu_op):
+        ALU_control_signals = self.ALU_control_unit(func_code, alu_op)
         # print(f"ALU control signals: {ALU_control_signals}")
         alu_result, zero_flag, overflow = self.ALU_32(ALU_control_signals, rData1, rData2)
+
+        if alu_op == 0b011:  # LUI operation
+            alu_result = (rData2 << 16) & 0xFFFFFFFF
+
         return alu_result, zero_flag, overflow
-    def ALU_control_unit(self, func_code,alu_op1, alu_op0):
-        # print(f"ALU_control_unit: func_code={func_code}, alu_op1={alu_op1}, alu_op0={alu_op0}")
+    def ALU_control_unit(self, func_code,alu_op):
+
+        # print(f"ALU_control_unit: func_code={func_code}, alu_op = {alu_op}")
         signals = [0] * 4 # [ainvert,binvert, op1, op0]
-        if alu_op1 == 0 and alu_op0 == 0:
-            signals[2] = 1  #add for lw, sw, addi
-        elif alu_op1 == 0 and alu_op0 == 1:
-            signals[1] = 1  #sub for beq
-            signals[2] = 1
-        elif alu_op1 ==1 and alu_op0 == 0:
-            if func_code == 0b100100: #and
-                # do nothing, default is [0,0,0,0]
-                pass
-            elif func_code == 0b100101: #or
-                signals[3] = 1
-            elif func_code == 0b100000: #add
-                signals[2] = 1
-            elif func_code == 0b100010: #sub
-                signals[1] = 1
-                signals[2] = 1
-            elif func_code == 0b100111: #nor
-                signals[0] = 1
-                signals[1] = 1
-            elif func_code == 0b101010: #slt
-                signals[1] = 1
-                signals[2] = 1
-                signals[3] = 1
+        match alu_op,func_code:
+            case 0b010, 0b100100: pass #and
+            case 0b010, 0b100101: signals[3] = 1 #or
+            case 0b010, 0b100000: signals[2] = 1 #add
+            case 0b010, 0b100010: signals[1] = 1; signals[2] = 1 #sub
+            case 0b010, 0b100111: signals[0] = 1; signals[1] = 1 #nor
+            case 0b010, 0b101010: signals[1] = 1; signals[2] = 1; signals[3] = 1 #slt
+            
+            case 0b000,_: signals[2] = 1 #lw, sw, addi(add)
+            case 0b001,_: signals[1] = 1; signals[2] = 1 #beq(sub)
+            case 0b100,_: signals[3] = 1 #ori
+            case _: pass
         return signals
     def ALU_32(self, table, op_a, op_b):
         op_a = op_a & 0xFFFFFFFF
@@ -355,6 +376,8 @@ class Compiler:
             'lw':   (0b100011, 0b000000, 'I'),
             'sw':   (0b101011, 0b000000, 'I'),
             'beq':  (0b000100, 0b000000, 'I'),
+            'lui':  (0b001111, 0b000000, 'I'),
+            'ori':  (0b001101, 0b000000, 'I'),
 
             'j':    (0b000010, 0b000000, 'J'),
         }
@@ -389,7 +412,10 @@ class Compiler:
         if cmd[2].find("(") != -1 and cmd[2].find(")") != -1: #lw/sw format: lw $t0, 4($t1)
             cmd.insert(3, cmd[2].split("(")[0])
             cmd[2] = cmd[2].split("(")[1].split(")")[0]
-        # print(f"cmd after parsing: {cmd}")
+        if cmd[0].lower() == "lui":
+            cmd.insert(2, "zero")
+        print(f"cmd after parsing: {cmd}")
+
         if len(cmd) < 4:
             self.exception = "Invalid I-type instruction format: Not enough arguments"
             bin_code = self.nop
@@ -546,8 +572,7 @@ class Loader:
             self.memory.write(address, instruction)
         self.memory.write(address+4, 0b00100000000000100000000000001010) #addi $v0, $zero, 10
         self.memory.write(address+8, 0x0000000C) #syscall
-    def exception_loader(self):
-        pass
+
 class SimpleOS:
     def __init__(self, CPU):
         self.CPU = CPU
@@ -574,16 +599,40 @@ class SimpleOS:
         EX_CODE = (Cause >> 2) & 0x1F
         print(f"Exception Code: {hex(EX_CODE)}")
         print(f"Exception Type: {self.cause_map.get(EX_CODE, 'Unknown')}")
-        if EX_CODE == 0x08:
-            print(f"v0: {self.CPU.registers.read_register(self.CPU.registers.name_map['v0']):#010x}")
-            if self.CPU.registers.read_register(self.CPU.registers.name_map['v0']) == 10: 
-                print("exit!")
-                return 0
-            self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC']) + 4
-            self.CPU.cp0.eret()
-            return 1
+        match EX_CODE:
+            case 0x08:
+                return self.syscall_handler()
         return 0
-
+    def syscall_handler(self):
+        v0 = self.CPU.registers.read_register(self.CPU.registers.name_map['v0'])
+        print(f"Syscall code: {v0}")
+        match v0:
+            case 0: # do nothing for testing only
+                print("Syscall: No operation(testing only)")
+            case 1:  # print integer
+                a0 = self.CPU.registers.read_register(self.CPU.registers.name_map['a0'])
+                print(f"Syscall: Print Integer: {a0}")
+            case 4:  # print string
+                a0 = self.CPU.registers.read_register(self.CPU.registers.name_map['a0'])
+                string = ""
+                while True:
+                    char_code = self.CPU.memory.read_byte(a0)
+                    # print(f"Reading char code {char_code} from address {hex(a0)}")
+                    if char_code == 0:
+                        break
+                    string += chr(char_code)
+                    # print(f"Current string: {string}")
+                    a0 += 1
+                print(f"Syscall: Print String: {string}")
+            case 10:  # exit
+                print("Syscall: Exit")
+                return 0
+            case _:
+                print(f"Syscall: Unknown syscall code {v0}")
+                return 0
+        self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC']) + 4
+        self.CPU.cp0.eret()
+        return 1
 def interface():
     CPU = CPUCore()
     registers = CPU.registers
@@ -677,7 +726,7 @@ end_loop:
 #     beq  $t3, $zero, loop
 # """
     code = """
-addi $t0, $zero, 6
+addi $t0, $zero, 46
 addi $t0, $t0, -2
 addi $t1, $zero, 0
 sw $t1, 0($sp)
@@ -693,7 +742,22 @@ sw $t3, 0($sp)
 addi $t0, $t0, -1
 slt $t4, $t0, $zero
 beq $t4, $zero, Loop
+add $a0, $zero, $sp
+addi $v0, $zero, 1
+syscall
+"""
 
+    code = """
+addi $sp, $sp, -8
+lui $t0,0
+ori $t0, $t0, 0x3233
+sw $t0, 4($sp)
+lui $t0, 0x5350
+ori $t0, $t0, 0x494D
+sw $t0, 0($sp)
+add $a0, $zero, $sp
+addi $v0, $zero, 4
+syscall
 """
 
     program = []

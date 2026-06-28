@@ -14,7 +14,7 @@ A MIPS32 CPU Simulator implemented in Python. This project simulates the core ha
 - `syscall`(exit only)
 
 ### I-Type Instructions
-- `addi`
+- `addi`/`ori`/`lui`
 - `lw`/`sw`/`beq`(label support!)
 
 ### J-Type Instructions
