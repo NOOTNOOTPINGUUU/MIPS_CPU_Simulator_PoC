@@ -3,6 +3,35 @@ def get_bits(val, start, end): #support function to extract bits from a value
     length = end - start + 1
     mask = (1 << length) - 1
     return (val >> start) & mask
+class AutoZeroDict(dict):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for key, value in list(self.items()):
+            if isinstance(value, dict) and not isinstance(value, AutoZeroDict):
+                self[key] = AutoZeroDict(value)
+
+    def __getitem__(self, item):
+        try:
+            return super().__getitem__(item)
+        except KeyError:
+            return AutoZero()
+
+    def copy(self):
+
+        new_copied_dict = AutoZeroDict()
+        for key, value in self.items():
+            if isinstance(value, AutoZeroDict):
+                new_copied_dict[key] = value.copy()
+            else:
+                new_copied_dict[key] = value
+        return new_copied_dict
+class AutoZero(int):
+    def __new__(cls):
+        return super().__new__(cls, 0)
+    def __getitem__(self, item):
+        return self
+    def get(self, item, default=0):
+        return self
 
 class ZeroTouchGround(list):
     def __setitem__(self, key, value):
@@ -86,7 +115,401 @@ class CP0:
         changed = {f"{name}": self._regs[idx] for name, idx in self.name_map.items()}
         return changed
 
+class StagePipelineRegister:
+    def __init__(self):
+        self.current = AutoZeroDict()
+        self.next = AutoZeroDict()
+        self.flush_signal = 0
+    def read(self):
+        return self.current
+    def write(self,data):
+        self.next = AutoZeroDict(data)
+    def tick(self):
+        if self.flush_signal:
+            self.current = AutoZeroDict()
+            self.flush_signal = 0
+        else:
+            self.current = self.next.copy()
+    def flush(self):
+        self.flush_signal = 1
+class Forwarding_Unit:
+    def __init__(self):
+        self.ex_mem_RegWrite = 0
+        self.mem_wb_RegWrite = 0
+        self.ex_mem_RegDst = 0
+        self.mem_wb_RegDst = 0
+        self.id_ex_rs = 0
+        self.id_ex_rt = 0
 
+
+
+    def determine_forwarding_paths(self ,id_ex_rs ,id_ex_rt):
+        self.id_ex_rs = id_ex_rs
+        self.id_ex_rt = id_ex_rt
+        FW_A = 0
+        FW_B = 0
+        #ReadAfterWrite
+        # MEM_WB        
+        if self.mem_wb_RegWrite ==1 and self.mem_wb_RegDst !=0:
+            if self.mem_wb_RegDst == self.id_ex_rs:
+                FW_A = 1
+            if self.mem_wb_RegDst == self.id_ex_rt:
+                FW_B = 1
+        # EX_MEM
+        if self.ex_mem_RegWrite ==1 and self.ex_mem_RegDst !=0:
+            if self.ex_mem_RegDst == self.id_ex_rs:
+                FW_A = 2
+            if self.ex_mem_RegDst == self.id_ex_rt:
+                FW_B = 2
+        # print(f"FW_A: {FW_A}, FW_B: {FW_B}, id_ex_rs: {id_ex_rs}, id_ex_rt: {id_ex_rt}, mem_wb_RegWrite: {self.mem_wb_RegWrite}, mem_wb_RegDst: {self.mem_wb_RegDst}, ex_mem_RegWrite: {self.ex_mem_RegWrite}, ex_mem_RegDst: {self.ex_mem_RegDst}")
+        return FW_A, FW_B
+class Pipelined_CPUCore:
+    def __init__(self):
+        self.IF_ID = StagePipelineRegister()
+        self.ID_EX = StagePipelineRegister()
+        self.EX_MEM = StagePipelineRegister()
+        self.MEM_WB = StagePipelineRegister()
+        self.registers = Registers()
+        self.alu = ALU()
+        self.cp0 = CP0()
+        self.pc = 0x00400000 #Program_Counter
+        self.memory = Memory()
+        
+        self.overflow = 0
+        
+        self.exception = None
+        self.EV_ADDRESS = 0x80000180 # Exception Vector Address
+        self.cp0.to_user_mode()
+
+        # IF_control_Hazard
+        self.PCSrcJ = 0
+        self.PCSrcB = 0
+        self.PCSrc_Exception = 0
+        self.Forward_AddrJ = 0
+        self.Forward_AddrB = 0
+
+        self.Forwarding_unit = Forwarding_Unit()
+        # EX_forwarding_unit
+        self.Forward_EX_MEM_data = 0
+        self.Forward_MEM_WB_data = 0
+
+    def IF(self):
+        bin_code = self.Instruction_MEM(self.pc)
+        EXL = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 1, 1)
+        UM = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 4, 4)
+        EX_CODE = 0x00
+        EPC = self.pc
+        pc = self.pc + 4
+        print(f"PC: {hex(self.pc)}, Instruction: {bin_code:032b}, EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
+        
+        self.pc = pc
+        if self.PCSrcB == 1:
+            self.pc = self.Forward_AddrB
+            self.PCSrcB = 0
+            self.IF_ID.flush()
+        if self.PCSrcJ == 1:
+            self.pc = self.Forward_AddrJ
+            self.PCSrcJ = 0
+            self.IF_ID.flush()
+        if self.PCSrc_Exception == 1:
+            self.pc = self.EV_ADDRESS
+            self.PCSrc_Exception = 0
+
+        return {
+            "bin_code": bin_code,
+            "EXL": EXL,
+            "UM": UM,
+            "EX_CODE": EX_CODE,
+            "EPC": EPC,
+            "pc": pc,
+        }
+        # print(f"EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
+    def ID(self, if_info):
+        bin_code = if_info["bin_code"]
+        EXL = if_info["EXL"]
+        UM = if_info["UM"]
+        EX_CODE = if_info["EX_CODE"]
+        pc = if_info["pc"]
+
+        # print(f"get_bits(bin_code, 0, 5): {get_bits(bin_code, 26, 31):06b}")
+        control_signals = self.control_unit(get_bits(bin_code, 26, 31))
+        # print(f"Control signals: {control_signals}")
+        if get_bits(bin_code, 26, 31) == 0 and get_bits(bin_code, 0, 5) == 0b001100:
+            # print(f"Syscall detected")
+            # display = self.registers.dump()
+            # for i in range(0, len(display), 4):
+            #     print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
+            EX_CODE = 0x08
+            # self.cp0.to_exception_mode()
+            control_signals["reg_write"] = 0
+            control_signals["mem_write"] = 0
+        rs_index = get_bits(bin_code, 21, 25)
+        rt_index = get_bits(bin_code, 16, 20)
+        rd_index = get_bits(bin_code, 11, 15)
+
+        rData1 = self.registers.read_register(rs_index)
+        rData2 = self.registers.read_register(rt_index)
+
+        immt = get_bits(bin_code, 0, 15)
+        sign_bit = (immt >> 15) & 1
+        if control_signals["sign_ext"]:
+            if sign_bit == 1:
+                immt |= 0xFFFF0000 #sign extend
+            else:
+                immt &= 0x0000FFFF #zero extend
+        # print(f"imm: {immt}")
+
+        # Branch
+
+        branch_address = immt << 2
+        branch_address = (pc + branch_address)& 0xFFFFFFFF
+        if control_signals["branch"] and rData1 == rData2:
+            self.PCSrcB = 1
+            self.Forward_AddrB = branch_address
+        
+        jAddress = get_bits(bin_code, 0, 25)
+        jAddress = jAddress << 2
+        jAddress = (get_bits(self.pc, 28, 31) << 28) | jAddress
+        if control_signals["jump"]:
+            self.PCSrcJ = 1
+            self.Forward_AddrJ = jAddress
+            
+        return {
+            "EXL": EXL,
+            "UM": UM,
+            "EX_CODE": EX_CODE,
+            "EPC": if_info["EPC"],
+            "WB_signals":{"reg_write":control_signals["reg_write"]},
+            "MEM_signals":{"mem_read":control_signals["mem_read"],"mem_write":control_signals["mem_write"]},
+            "EX_signals":{"alu_op":control_signals["alu_op"],"alu_src":control_signals["alu_src"],"reg_dst":control_signals["reg_dst"],
+                        },
+            "rData1": rData1,
+            "rData2": rData2,
+            "immt": immt,
+            "rs_index": rs_index,
+            "rd_index": rd_index,
+            "rt_index": rt_index,
+            "pc": if_info["pc"]
+        }
+    def EX(self, id_info):
+        EX_CODE = id_info["EX_CODE"]
+        WB_signals = id_info["WB_signals"]
+        MEM_signals = id_info["MEM_signals"]
+        EX_signals = id_info["EX_signals"]
+        rData1 = id_info["rData1"]
+        rData2 = id_info["rData2"]
+        immt = id_info["immt"]
+        rs_index = id_info["rs_index"]
+        rd_index = id_info["rd_index"]
+        rt_index = id_info["rt_index"]
+        pc = id_info["pc"]
+        
+        alu_inputA = rData1
+        alu_inputB = rData2
+        # print(control_signals["alu_src"])
+
+        
+        FW_A, FW_B = self.Forwarding_unit.determine_forwarding_paths(rs_index, rt_index)
+        # print(f"Forwarding A: {FW_A}, Forwarding B: {FW_B}, rData1: {rs_index}:{rData1}, rData2: {rt_index}:{rData2}")
+        if FW_A == 2:
+            alu_inputA = self.Forward_EX_MEM_data
+        elif FW_A == 1:
+            alu_inputA = self.Forward_MEM_WB_data
+        if FW_B == 2:
+            alu_inputB = self.Forward_EX_MEM_data
+        elif FW_B == 1:
+            alu_inputB = self.Forward_MEM_WB_data
+        if EX_signals["alu_src"]:  #alu_src multiplexor
+            alu_inputB = immt  # immediate value
+        result, zero_flag, self.overflow = self.alu.execute(alu_inputA, alu_inputB, get_bits(immt, 0, 5), EX_signals["alu_op"])
+        # print(f"ALU result: {result},alu_inputA: {alu_inputA}, alu_inputB: {alu_inputB},FW_A: {FW_A},FW_B: {FW_B}, zero_flag: {zero_flag}")
+        # print(control_signals["reg_dst"])
+        if EX_signals["reg_dst"]:
+            regd = rd_index
+        else:
+            regd = rt_index
+        if self.overflow and EX_CODE== 0x00:
+            print("Overflow occurred. Result not written to register.")
+            WB_signals["reg_write"] = 0
+            MEM_signals["mem_write"] = 0
+            self.overflow = 0  # Reset overflow flag after handling
+            EX_CODE = 0x0C
+        return {
+            "EXL": id_info["EXL"],
+            "UM": id_info["UM"],
+            "EX_CODE": EX_CODE,
+            "EPC": id_info["EPC"],
+            "WB_signals":WB_signals,
+            "MEM_signals":MEM_signals,
+            "result":result,
+            "zero_flag":zero_flag,
+            "rData2":rData2,
+            "regd":regd,
+            "pc":pc,
+        }
+    def MEM(self, ex_info):
+        EXL = ex_info["EXL"]
+        UM = ex_info["UM"]
+        EX_CODE = ex_info["EX_CODE"]
+        EPC = ex_info["EPC"]
+        WB_signals = ex_info["WB_signals"]
+        MEM_signals = ex_info["MEM_signals"]
+        result = ex_info["result"]
+        zero_flag = ex_info["zero_flag"]
+        rData2 = ex_info["rData2"]
+        regd = ex_info["regd"]
+        pc = ex_info["pc"]
+
+        self.Forward_EX_MEM_data = result
+        self.Forwarding_unit.ex_mem_RegWrite = WB_signals["reg_write"]
+        self.Forwarding_unit.ex_mem_RegDst = regd
+
+        rMData = 0
+        Error_CODE = 0x00
+        if MEM_signals["mem_read"]==1 or MEM_signals["mem_write"]==1:
+            rMData , Error_CODE= self.Data_Memory(result, rData2, MEM_signals["mem_read"], MEM_signals["mem_write"],EXL, UM)
+            
+        if Error_CODE!=0:
+            WB_signals["reg_write"] = 0
+            EX_CODE = Error_CODE
+
+        # ExL handle
+        if EX_CODE!=0x00:
+            #TODO : EPC adjust depends on stageEXP
+            self.cp0.write_register(self.cp0.name_map['Cause'], EX_CODE<<2)
+            if EX_CODE == 0x08:
+                self.cp0.write_register(self.cp0.name_map['EPC'], EPC+4)
+            else:
+                self.cp0.write_register(self.cp0.name_map['EPC'], EPC)
+            self.cp0.to_exception_mode() 
+            self.PCSrc_Exception = 1
+            self.IF_ID.flush()
+            self.ID_EX.flush()
+            self.EX_MEM.flush()
+        
+        return {
+            "WB_signals":WB_signals,
+            "rMData":rMData,
+            "result":result,
+            "regd":regd,
+        }
+    def WB(self, mem_info):
+        WB_signals = mem_info["WB_signals"]
+        rMData = mem_info["rMData"]
+        result = mem_info["result"]
+        regd = mem_info["regd"]
+        
+        self.Forwarding_unit.mem_wb_RegWrite = WB_signals["reg_write"]
+        self.Forwarding_unit.mem_wb_RegDst = regd
+
+        if WB_signals["mem_to_reg"]:
+            print(f"Memory read: {bin(rMData)} from address {hex(result)}")
+            result = rMData
+
+        # print(f"Writing to register index {regd} with value {result}")
+        if WB_signals["reg_write"]:
+            self.registers.write_register(regd, result)
+
+        self.Forward_MEM_WB_data = result
+
+    def execute(self):
+        # ===WB===
+        self.WB(self.MEM_WB.read())
+        # ===MEM===
+        mem_result = self.MEM(self.EX_MEM.read())
+        self.MEM_WB.write(mem_result)
+        # ===EX===
+        ex_result = self.EX(self.ID_EX.read())
+        self.EX_MEM.write(ex_result)
+        # ===ID===
+        id_result = self.ID(self.IF_ID.read())
+        self.ID_EX.write(id_result)
+        # ===IF===
+        if_result = self.IF()
+        self.IF_ID.write(if_result)
+
+        self.IF_ID.tick()
+        self.ID_EX.tick()
+        self.EX_MEM.tick()
+        self.MEM_WB.tick()
+
+                
+
+
+
+    def Instruction_MEM(self, address):
+        instruction = self.memory.read(address)
+        return instruction
+    def control_unit(self, opcode):
+        signals ={
+            "reg_dst": 0,
+            "alu_src": 0,
+            "mem_to_reg": 0,
+            "reg_write": 0,
+            "mem_read": 0,
+            "mem_write": 0,
+            "branch": 0,
+            "sign_ext": 0,
+            "alu_op": 0,
+            "jump": 0
+        }
+        op = []
+        for i in range(6):
+            op.append(opcode & (1<<5-i))
+        r_type, lw, sw, beq, addi,lui = 0,0,0,0,0,0
+        r_type = (not op[5]) and (not op[4]) and (not op[3]) and (not op[2]) and (not op[1]) and (not op[0]) #000000
+        lw = op[5] and op[4] and (not op[3]) and (not op[2]) and (not op[1]) and op[0] #100011
+        sw = op[5] and op[4] and (not op[3]) and op[2] and (not op[1]) and op[0] #101011
+        beq = (not op[5]) and (not op[4]) and op[3] and (not op[2]) and (not op[1]) and (not op[0]) #000100
+        j = (not op[5]) and op[4] and (not op[3]) and (not op[2]) and (not op[1]) and (not op[0]) #000010
+        lui = op[5] and  op[4] and  op[3] and op[2] and (not op[1]) and (not op[0]) #001111
+        addi = (not op[5]) and (not op[4]) and (not op[3]) and op[2] and (not op[1]) and (not op[0]) #00100
+        ori = op[5] and (not op[4]) and op[3] and op[2] and (not op[1]) and (not op[0]) #001101
+        # r_type = bool(r_type)
+        # lw = bool(lw)
+        # sw = bool(sw)
+        # beq = bool(beq)
+        signals["reg_dst"] = r_type
+        signals["alu_src"] = (lw or sw or addi or lui or ori)
+        signals["mem_to_reg"] = lw
+        signals["reg_write"] = (r_type or lw or addi or lui or ori)
+        signals["mem_read"] = lw
+        signals["mem_write"] = sw
+        signals["branch"] = beq
+        signals["jump"] = j
+        signals["sign_ext"] = lw or sw or beq or addi
+        
+        for key,value in signals.items():
+            signals[key] = 1 if value else 0 # Formatting for clear looks <3
+        alu_3bits = 0
+        if r_type:
+            alu_3bits |= 0b010
+        elif beq:
+            alu_3bits |= 0b001
+        elif lui:
+            alu_3bits |= 0b011
+        elif ori:
+            alu_3bits |= 0b100
+        signals["alu_op"] = alu_3bits
+
+        # print(f"op: {op}")
+        # print(f"r_type: {r_type}, lw: {lw}, sw: {sw}, beq: {beq}")
+        # print(f"control_unit: {signals}")
+        return signals
+    def Data_Memory(self, address, write_data, mem_read, mem_write, EXL, UM):
+        is_Kernal = (not UM) or EXL
+        if not is_Kernal and get_bits(address, 31, 31) == 1:
+            print(f"Address Error on Load/Store: {hex(address)} is out of range") #0x04 AdEL illegal memory access
+            return 0 , 0x04
+        if address & 0x00000003 != 0:
+            print(f"Address Error on Load/Store: {hex(address)} must be word-aligned") #0x05 AdES misaligned memory
+            return 0 , 0x05
+
+        if mem_read:
+            return self.memory.read(address) ,0
+        if mem_write:
+            self.memory.write(address, write_data)
+            return 0 ,0
 class CPUCore:
     def __init__(self):
         self.registers = Registers()
@@ -154,7 +577,7 @@ class CPUCore:
             alu_input = immt  # immediate value
             # print(f"ALUSrc is 1, using constant {op_b} as op_b")
         # print(f"rData1: {rData1}, rData2: {rData2},alu_input: {alu_input}, opcode: {get_bits(bin_code, 0, 5)}, control_signals: {control_signals}")
-        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, get_bits(bin_code, 0, 5), control_signals["alu_op"])
+        result, zero_flag, self.overflow = self.alu.execute(rData1, alu_input, get_bits(immt, 0, 5), control_signals["alu_op"])
         # print(f"ALU result: {result}, zero_flag: {zero_flag}")
 
         # ===MEM===
@@ -200,7 +623,7 @@ class CPUCore:
         self.cp0.write_register(self.cp0.name_map['Cause'], EX_CODE<<2) 
         if EXL:
             pc = self.EV_ADDRESS
-            self.cp0.write_register(self.cp0.name_map['EPC'], self.pc)
+            self.cp0.write_register(self.cp0.name_map['EPC'], self.pc+4)
             self.cp0.to_exception_mode()
         
         self.pc = pc
@@ -583,7 +1006,9 @@ class SimpleOS:
             0x0C: "Overflow",
         }
     def run(self):
-        while True:
+        i =0
+        while i<100:
+            i+=1
             self.CPU.execute()
             if self.CPU.pc == self.CPU.EV_ADDRESS:
                 if self.exception_handler():
@@ -626,15 +1051,18 @@ class SimpleOS:
                 print(f"Syscall: Print String: {string}")
             case 10:  # exit
                 print("Syscall: Exit")
+                self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC'])
+                self.CPU.cp0.eret()
                 return 0
             case _:
                 print(f"Syscall: Unknown syscall code {v0}")
                 return 0
-        self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC']) + 4
+        self.CPU.pc = self.CPU.cp0.read_register(self.CPU.cp0.name_map['EPC'])
         self.CPU.cp0.eret()
         return 1
 def interface():
-    CPU = CPUCore()
+    # CPU = CPUCore()
+    CPU = Pipelined_CPUCore()
     registers = CPU.registers
     compiler_32 = Compiler(registers)
     loader = Loader(CPU)
@@ -759,6 +1187,25 @@ add $a0, $zero, $sp
 addi $v0, $zero, 4
 syscall
 """
+#     code = """
+# beq $zero, $zero, label
+# addi $s0, $zero, 5
+# addi $s2, $zero, 5
+# addi $s3, $zero, 5
+
+# label:
+# addi $s1, $zero, 5
+# sll $zero, $zero, 0
+
+# """
+#     code = """
+# addi $s1, $zero, 1
+# add $s1, $s1, $s1
+# add $s1, $s1, $s1
+# add $s1, $s1, $s1
+# syscall
+# add $s1, $s1, $s1
+# """
 
     program = []
     print("Welcome to the command line interface. Type 'exit' to quit.")
