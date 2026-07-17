@@ -120,6 +120,7 @@ class StagePipelineRegister:
         self.current = AutoZeroDict()
         self.next = AutoZeroDict()
         self.flush_signal = 0
+        self.stay_signal = 0
     def read(self):
         return self.current
     def write(self,data):
@@ -128,10 +129,15 @@ class StagePipelineRegister:
         if self.flush_signal:
             self.current = AutoZeroDict()
             self.flush_signal = 0
+        elif self.stay_signal:
+            self.stay_signal = 0
         else:
             self.current = self.next.copy()
     def flush(self):
         self.flush_signal = 1
+    def stay(self):
+        self.stay_signal = 1
+        
 class Forwarding_Unit:
     def __init__(self):
         self.ex_mem_RegWrite = 0
@@ -141,6 +147,8 @@ class Forwarding_Unit:
         self.id_ex_rs = 0
         self.id_ex_rt = 0
 
+        self.ex_mem_MemWrite = 0
+        self.mem_wb_MemRead = 0
 
 
     def determine_forwarding_paths(self ,id_ex_rs ,id_ex_rt):
@@ -163,6 +171,30 @@ class Forwarding_Unit:
                 FW_B = 2
         # print(f"FW_A: {FW_A}, FW_B: {FW_B}, id_ex_rs: {id_ex_rs}, id_ex_rt: {id_ex_rt}, mem_wb_RegWrite: {self.mem_wb_RegWrite}, mem_wb_RegDst: {self.mem_wb_RegDst}, ex_mem_RegWrite: {self.ex_mem_RegWrite}, ex_mem_RegDst: {self.ex_mem_RegDst}")
         return FW_A, FW_B
+    def determine_mem_hazard(self, ex_mem_MemWrite):
+        self.ex_mem_MemWrite = ex_mem_MemWrite
+        FW = 0
+        # MEM-to-MEM Data Hazard
+        if (self.mem_wb_MemRead == 1) and (self.ex_mem_MemWrite == 1) and (self.mem_wb_RegDst !=0) and (self.ex_mem_RegDst == self.mem_wb_RegDst):
+            FW = 1
+        # print(f"mem_wb_MemRead: {self.mem_wb_MemRead}, ex_mem_MemWrite: {self.ex_mem_MemWrite}, mem_wb_RegDst: {self.mem_wb_RegDst}, ex_mem_RegDst: {self.ex_mem_RegDst}")
+        return FW
+
+class Hazard_Detection_Unit:
+    def __init__(self):
+        # load-use
+        self.if_id_rs = 0
+        self.if_id_rt = 0
+        self.id_ex_rt = 0
+        self.id_ex_MemRead = 0
+
+    def load_use_hazard(self):
+
+        if self.id_ex_MemRead == 1 and (self.id_ex_rt == self.if_id_rs or self.id_ex_rt == self.if_id_rt):
+            return 1
+        else:
+            return 0
+    
 class Pipelined_CPUCore:
     def __init__(self):
         self.IF_ID = StagePipelineRegister()
@@ -193,6 +225,8 @@ class Pipelined_CPUCore:
         self.Forward_EX_MEM_data = 0
         self.Forward_MEM_WB_data = 0
 
+        self.Hazard_Detection_Unit = Hazard_Detection_Unit()
+        self.PCWrite = 0
     def IF(self):
         bin_code = self.Instruction_MEM(self.pc)
         EXL = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 1, 1)
@@ -201,7 +235,10 @@ class Pipelined_CPUCore:
         EPC = self.pc
         pc = self.pc + 4
         print(f"PC: {hex(self.pc)}, Instruction: {bin_code:032b}, EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
-        
+
+        if self.PCWrite == 1:
+            pc = self.pc     
+            self.PCWrite = 0     
         self.pc = pc
         if self.PCSrcB == 1:
             self.pc = self.Forward_AddrB
@@ -230,7 +267,7 @@ class Pipelined_CPUCore:
         UM = if_info["UM"]
         EX_CODE = if_info["EX_CODE"]
         pc = if_info["pc"]
-
+        
         # print(f"get_bits(bin_code, 0, 5): {get_bits(bin_code, 26, 31):06b}")
         control_signals = self.control_unit(get_bits(bin_code, 26, 31))
         # print(f"Control signals: {control_signals}")
@@ -246,6 +283,23 @@ class Pipelined_CPUCore:
         rs_index = get_bits(bin_code, 21, 25)
         rt_index = get_bits(bin_code, 16, 20)
         rd_index = get_bits(bin_code, 11, 15)
+
+        self.Hazard_Detection_Unit.if_id_rs = rs_index
+        self.Hazard_Detection_Unit.if_id_rt = rt_index
+
+        stall = 0
+        IF_ID_Write = 0
+        PC_Write = 0
+        if self.Hazard_Detection_Unit.load_use_hazard():
+            stall = 1
+            IF_ID_Write = 1
+            PC_Write = 1
+        if stall:
+            self.ID_EX.flush()
+        if IF_ID_Write:
+            self.IF_ID.stay()
+        if PC_Write:
+            self.PCWrite = 1
 
         rData1 = self.registers.read_register(rs_index)
         rData2 = self.registers.read_register(rt_index)
@@ -279,7 +333,7 @@ class Pipelined_CPUCore:
             "UM": UM,
             "EX_CODE": EX_CODE,
             "EPC": if_info["EPC"],
-            "WB_signals":{"reg_write":control_signals["reg_write"]},
+            "WB_signals":{"mem_to_reg":control_signals["mem_to_reg"],"reg_write":control_signals["reg_write"]},
             "MEM_signals":{"mem_read":control_signals["mem_read"],"mem_write":control_signals["mem_write"]},
             "EX_signals":{"alu_op":control_signals["alu_op"],"alu_src":control_signals["alu_src"],"reg_dst":control_signals["reg_dst"],
                         },
@@ -308,7 +362,8 @@ class Pipelined_CPUCore:
         alu_inputB = rData2
         # print(control_signals["alu_src"])
 
-        
+        self.Hazard_Detection_Unit.id_ex_rt = rt_index
+        self.Hazard_Detection_Unit.id_ex_MemRead = MEM_signals["mem_read"]
         FW_A, FW_B = self.Forwarding_unit.determine_forwarding_paths(rs_index, rt_index)
         # print(f"Forwarding A: {FW_A}, Forwarding B: {FW_B}, rData1: {rs_index}:{rData1}, rData2: {rt_index}:{rData2}")
         if FW_A == 2:
@@ -317,6 +372,7 @@ class Pipelined_CPUCore:
             alu_inputA = self.Forward_MEM_WB_data
         if FW_B == 2:
             alu_inputB = self.Forward_EX_MEM_data
+            rData2 = alu_inputB
         elif FW_B == 1:
             alu_inputB = self.Forward_MEM_WB_data
         if EX_signals["alu_src"]:  #alu_src multiplexor
@@ -363,7 +419,10 @@ class Pipelined_CPUCore:
         self.Forward_EX_MEM_data = result
         self.Forwarding_unit.ex_mem_RegWrite = WB_signals["reg_write"]
         self.Forwarding_unit.ex_mem_RegDst = regd
+        FW_Mem = self.Forwarding_unit.determine_mem_hazard(MEM_signals["mem_write"])
 
+        if FW_Mem: # MEM-to-MEM Data Hazard
+            rData2 = self.Forward_MEM_WB_data
         rMData = 0
         Error_CODE = 0x00
         if MEM_signals["mem_read"]==1 or MEM_signals["mem_write"]==1:
@@ -388,12 +447,14 @@ class Pipelined_CPUCore:
             self.EX_MEM.flush()
         
         return {
+            "mem_read":MEM_signals["mem_read"],
             "WB_signals":WB_signals,
             "rMData":rMData,
             "result":result,
             "regd":regd,
         }
     def WB(self, mem_info):
+        mem_read = mem_info["mem_read"]
         WB_signals = mem_info["WB_signals"]
         rMData = mem_info["rMData"]
         result = mem_info["result"]
@@ -401,7 +462,7 @@ class Pipelined_CPUCore:
         
         self.Forwarding_unit.mem_wb_RegWrite = WB_signals["reg_write"]
         self.Forwarding_unit.mem_wb_RegDst = regd
-
+        self.Forwarding_unit.mem_wb_MemRead = mem_read
         if WB_signals["mem_to_reg"]:
             print(f"Memory read: {bin(rMData)} from address {hex(result)}")
             result = rMData
@@ -413,30 +474,31 @@ class Pipelined_CPUCore:
         self.Forward_MEM_WB_data = result
 
     def execute(self):
+        recorder = Display()
         # ===WB===
         self.WB(self.MEM_WB.read())
         # ===MEM===
         mem_result = self.MEM(self.EX_MEM.read())
+        recorder.add_martrial("MEM",mem_result)
         self.MEM_WB.write(mem_result)
         # ===EX===
         ex_result = self.EX(self.ID_EX.read())
+        recorder.add_martrial("EX",ex_result)
         self.EX_MEM.write(ex_result)
         # ===ID===
         id_result = self.ID(self.IF_ID.read())
+        recorder.add_martrial("ID",id_result)
         self.ID_EX.write(id_result)
         # ===IF===
         if_result = self.IF()
+        recorder.add_martrial("IF",if_result)
         self.IF_ID.write(if_result)
 
         self.IF_ID.tick()
         self.ID_EX.tick()
         self.EX_MEM.tick()
         self.MEM_WB.tick()
-
-                
-
-
-
+        # recorder.dump()
     def Instruction_MEM(self, address):
         instruction = self.memory.read(address)
         return instruction
@@ -995,7 +1057,20 @@ class Loader:
             self.memory.write(address, instruction)
         self.memory.write(address+4, 0b00100000000000100000000000001010) #addi $v0, $zero, 10
         self.memory.write(address+8, 0x0000000C) #syscall
-
+class Display:
+    def __init__(self):
+        self.martials = {}
+    def add_martrial(self,id,martiral):
+        self.martials[id] = martiral
+    def dump(self):
+        print("""
+        ============================================================
+        """)
+        for id, martiral in self.martials.items():
+            print(f"{id}: {martiral}")
+        print("""
+        ============================================================
+        """)
 class SimpleOS:
     def __init__(self, CPU):
         self.CPU = CPU
@@ -1010,6 +1085,19 @@ class SimpleOS:
         while i<100:
             i+=1
             self.CPU.execute()
+            # display = self.CPU.registers.dump()
+            # for i in range(0, len(display), 4):
+                
+            #     print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
+            # display = self.CPU.memory.dump()
+            # for i in range(0, len(display), 4):
+            #     slot = []
+            #     slot.append(f"{list(display.keys())[i]}:")
+            #     data = 0
+            #     for j in range(i, i+4):
+            #         data|= list(display.values())[j]<<((3-(j-i))*8)
+            #     slot.append(f"{hex(data)}")
+            #     print(" ".join(slot))
             if self.CPU.pc == self.CPU.EV_ADDRESS:
                 if self.exception_handler():
                     continue
@@ -1170,23 +1258,23 @@ sw $t3, 0($sp)
 addi $t0, $t0, -1
 slt $t4, $t0, $zero
 beq $t4, $zero, Loop
-add $a0, $zero, $sp
+lw $a0, 0($sp)
 addi $v0, $zero, 1
 syscall
 """
 
-    code = """
-addi $sp, $sp, -8
-lui $t0,0
-ori $t0, $t0, 0x3233
-sw $t0, 4($sp)
-lui $t0, 0x5350
-ori $t0, $t0, 0x494D
-sw $t0, 0($sp)
-add $a0, $zero, $sp
-addi $v0, $zero, 4
-syscall
-"""
+#     code = """
+# addi $sp, $sp, -8
+# lui $t0,0
+# ori $t0, $t0, 0x3233
+# sw $t0, 4($sp)
+# lui $t0, 0x5350
+# ori $t0, $t0, 0x494D
+# sw $t0, 0($sp)
+# add $a0, $zero, $sp
+# addi $v0, $zero, 4
+# syscall
+# """
 #     code = """
 # beq $zero, $zero, label
 # addi $s0, $zero, 5
@@ -1205,6 +1293,26 @@ syscall
 # add $s1, $s1, $s1
 # syscall
 # add $s1, $s1, $s1
+# """
+    code = """
+addi $s0, $zero, 1
+addi $s1, $zero, 2
+addi $s2, $zero, 3
+sw $s2, -4($sp)
+lw $s3, -4($sp)
+add $s4, $zero, $s3
+"""   
+#     code = """
+# addi $s1, $zero, 0
+# addi $s0, $zero, 5
+# addi $t0, $zero, 0
+# check:
+# slt $t2, $t0, $s0
+# beq $t2, $zero, end_check
+# addi $t0, $t0, 1
+# add $s1, $s1, $s0
+# j check
+# end_check:
 # """
 
     program = []
@@ -1229,7 +1337,13 @@ syscall
         if cmd == "memory" or cmd == "mem":
             display = CPU.memory.dump()
             for i in range(0, len(display), 4):
-                print(" ".join(f"{k}: {hex(v)}" for k, v in list(display.items())[i:i+4]))
+                slot = []
+                slot.append(f"{list(display.keys())[i]}:")
+                data = 0
+                for j in range(i, i+4):
+                    data|= list(display.values())[j]<<((3-(j-i))*8)
+                slot.append(f"{hex(data)}")
+                print(" ".join(slot))
             continue
         program = compiler_32.run(code)
         if compiler_32.errors:
