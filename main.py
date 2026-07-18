@@ -4,6 +4,7 @@ def get_bits(val, start, end): #support function to extract bits from a value
     mask = (1 << length) - 1
     return (val >> start) & mask
 class AutoZeroDict(dict):
+    DEBUG_MODE = True
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         for key, value in list(self.items()):
@@ -14,6 +15,10 @@ class AutoZeroDict(dict):
         try:
             return super().__getitem__(item)
         except KeyError:
+            if len(self) == 0:
+                return AutoZero()
+            if self.DEBUG_MODE:
+                print(f"Something is wrong: {item}, set to 0")
             return AutoZero()
 
     def copy(self):
@@ -157,18 +162,19 @@ class Forwarding_Unit:
         FW_A = 0
         FW_B = 0
         #ReadAfterWrite
-        # MEM_WB        
-        if self.mem_wb_RegWrite ==1 and self.mem_wb_RegDst !=0:
-            if self.mem_wb_RegDst == self.id_ex_rs:
-                FW_A = 1
-            if self.mem_wb_RegDst == self.id_ex_rt:
-                FW_B = 1
         # EX_MEM
         if self.ex_mem_RegWrite ==1 and self.ex_mem_RegDst !=0:
             if self.ex_mem_RegDst == self.id_ex_rs:
                 FW_A = 2
             if self.ex_mem_RegDst == self.id_ex_rt:
                 FW_B = 2
+        # MEM_WB        
+        if self.mem_wb_RegWrite ==1 and self.mem_wb_RegDst !=0:
+            if self.mem_wb_RegDst == self.id_ex_rs:
+                FW_A = 1
+            if self.mem_wb_RegDst == self.id_ex_rt:
+                FW_B = 1
+
         # print(f"FW_A: {FW_A}, FW_B: {FW_B}, id_ex_rs: {id_ex_rs}, id_ex_rt: {id_ex_rt}, mem_wb_RegWrite: {self.mem_wb_RegWrite}, mem_wb_RegDst: {self.mem_wb_RegDst}, ex_mem_RegWrite: {self.ex_mem_RegWrite}, ex_mem_RegDst: {self.ex_mem_RegDst}")
         return FW_A, FW_B
     def determine_mem_hazard(self, ex_mem_MemWrite):
@@ -179,22 +185,65 @@ class Forwarding_Unit:
             FW = 1
         # print(f"mem_wb_MemRead: {self.mem_wb_MemRead}, ex_mem_MemWrite: {self.ex_mem_MemWrite}, mem_wb_RegDst: {self.mem_wb_RegDst}, ex_mem_RegDst: {self.ex_mem_RegDst}")
         return FW
-
+    def branch_forwarding(self,rs_index, rt_index,branch):
+        FW_A = 0
+        FW_B = 0
+        if branch:
+            if self.ex_mem_RegWrite ==1 and self.ex_mem_RegDst !=0:
+                if self.ex_mem_RegDst == rs_index:
+                    FW_A = 2
+                if self.ex_mem_RegDst == rt_index:
+                    FW_B = 2
+            if self.mem_wb_RegWrite ==1 and self.mem_wb_MemRead ==1 and self.mem_wb_RegDst !=0:
+                if self.mem_wb_RegDst == rs_index:
+                    FW_A = 1
+                if self.mem_wb_RegDst == rt_index:
+                    FW_B = 1
+        return FW_A, FW_B
 class Hazard_Detection_Unit:
     def __init__(self):
+        self.stall_timer = 0
         # load-use
         self.if_id_rs = 0
         self.if_id_rt = 0
         self.id_ex_rt = 0
         self.id_ex_MemRead = 0
 
+        # branch
+        self.ex_mem_RegDst = 0
+        self.ex_mem_MemRead = 0
+        self.id_ex_RegWrite = 0
+    def hazard_detection(self, branch_signal):
+        if self.stall_timer > 0:
+            self.stall_timer -= 1
+            print("stall timer active, stall_timer = ",self.stall_timer)
+            return 1
+        if self.load_use_hazard():
+            print("load-use")
+            return 1
+        if self.branch_hazard_stall(branch_signal):
+            print("branch")
+            return 1
+        return 0
     def load_use_hazard(self):
-
-        if self.id_ex_MemRead == 1 and (self.id_ex_rt == self.if_id_rs or self.id_ex_rt == self.if_id_rt):
+        # print(f"if_id_rs: {self.if_id_rs}, if_id_rt: {self.if_id_rt}, id_ex_rt: {self.id_ex_rt}, id_ex_MemRead: {self.id_ex_MemRead}")
+        if self.id_ex_rt !=0 and self.id_ex_MemRead == 1 and (self.id_ex_rt == self.if_id_rs or self.id_ex_rt == self.if_id_rt):
             return 1
         else:
             return 0
-    
+    def branch_hazard_stall(self, branch_signal):
+        if branch_signal:
+            if self.id_ex_rt !=0 and (self.id_ex_rt == self.if_id_rs or self.id_ex_rt == self.if_id_rt):
+                if self.id_ex_MemRead:
+                    self.stall_timer = 1 #stall 2 times
+                    return 1 # lw then beq
+                elif self.id_ex_RegWrite:
+                    return 1 # add then beq
+            if self.ex_mem_RegDst !=0 and (self.ex_mem_RegDst == self.if_id_rs or self.ex_mem_RegDst == self.if_id_rt):
+                if self.ex_mem_MemRead:
+                    return 1 #lw ,inst then beq 
+        return 0
+
 class Pipelined_CPUCore:
     def __init__(self):
         self.IF_ID = StagePipelineRegister()
@@ -224,30 +273,31 @@ class Pipelined_CPUCore:
         # EX_forwarding_unit
         self.Forward_EX_MEM_data = 0
         self.Forward_MEM_WB_data = 0
+        self.Forward_MEM_WB_data_for_branch = 0
 
         self.Hazard_Detection_Unit = Hazard_Detection_Unit()
-        self.PCWrite = 0
+        self.PCWrite = 1
     def IF(self):
         bin_code = self.Instruction_MEM(self.pc)
         EXL = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 1, 1)
         UM = get_bits(self.cp0.read_register(self.cp0.name_map['Status']), 4, 4)
         EX_CODE = 0x00
         EPC = self.pc
-        pc = self.pc + 4
+        pc_plus_4 = self.pc + 4
+        pc = pc_plus_4
         print(f"PC: {hex(self.pc)}, Instruction: {bin_code:032b}, EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
 
-        if self.PCWrite == 1:
-            pc = self.pc     
-            self.PCWrite = 0     
-        self.pc = pc
         if self.PCSrcB == 1:
-            self.pc = self.Forward_AddrB
+            pc = self.Forward_AddrB
             self.PCSrcB = 0
-            self.IF_ID.flush()
         if self.PCSrcJ == 1:
-            self.pc = self.Forward_AddrJ
+            pc = self.Forward_AddrJ
             self.PCSrcJ = 0
-            self.IF_ID.flush()
+
+        if self.PCWrite == 1:
+            self.pc = pc
+        self.PCWrite = 1
+
         if self.PCSrc_Exception == 1:
             self.pc = self.EV_ADDRESS
             self.PCSrc_Exception = 0
@@ -258,7 +308,7 @@ class Pipelined_CPUCore:
             "UM": UM,
             "EX_CODE": EX_CODE,
             "EPC": EPC,
-            "pc": pc,
+            "pc": pc_plus_4,
         }
         # print(f"EXL: {EXL}, UM: {UM}, EX_CODE: {EX_CODE}")
     def ID(self, if_info):
@@ -287,20 +337,6 @@ class Pipelined_CPUCore:
         self.Hazard_Detection_Unit.if_id_rs = rs_index
         self.Hazard_Detection_Unit.if_id_rt = rt_index
 
-        stall = 0
-        IF_ID_Write = 0
-        PC_Write = 0
-        if self.Hazard_Detection_Unit.load_use_hazard():
-            stall = 1
-            IF_ID_Write = 1
-            PC_Write = 1
-        if stall:
-            self.ID_EX.flush()
-        if IF_ID_Write:
-            self.IF_ID.stay()
-        if PC_Write:
-            self.PCWrite = 1
-
         rData1 = self.registers.read_register(rs_index)
         rData2 = self.registers.read_register(rt_index)
 
@@ -313,21 +349,53 @@ class Pipelined_CPUCore:
                 immt &= 0x0000FFFF #zero extend
         # print(f"imm: {immt}")
 
+        stall = 0
+        IF_ID_Write = 0
+        self.PC_Write = 1
+        PC_dont_write = 0
+        if self.Hazard_Detection_Unit.hazard_detection(control_signals["branch"]):
+            stall = 1
+            IF_ID_Write = 1
+            PC_dont_write = 1
+        if stall:
+            self.ID_EX.flush()
+        if IF_ID_Write:
+            self.IF_ID.stay()
+        if PC_dont_write:
+            self.PCWrite = 0
+
         # Branch
 
         branch_address = immt << 2
         branch_address = (pc + branch_address)& 0xFFFFFFFF
-        if control_signals["branch"] and rData1 == rData2:
-            self.PCSrcB = 1
-            self.Forward_AddrB = branch_address
-        
+        branch_Data1 = rData1
+        branch_Data2 = rData2
+        B_FW_A,B_FW_B = self.Forwarding_unit.branch_forwarding(rs_index, rt_index,control_signals["branch"])
+        if B_FW_A == 2:
+            branch_Data1 = self.Forward_EX_MEM_data
+        elif B_FW_A == 1:
+            branch_Data1 = self.Forward_MEM_WB_data_for_branch
+        if B_FW_B == 2:
+            branch_Data2 = self.Forward_EX_MEM_data
+        elif B_FW_B == 1:
+            branch_Data2 = self.Forward_MEM_WB_data_for_branch
+        self.PCSrcB = 0
+        if branch_Data1 == branch_Data2:
+            if control_signals["branch"]:
+                self.PCSrcB = 1
+                self.Forward_AddrB = branch_address
+                if not stall:
+                    self.IF_ID.flush()
         jAddress = get_bits(bin_code, 0, 25)
         jAddress = jAddress << 2
         jAddress = (get_bits(self.pc, 28, 31) << 28) | jAddress
+        self.PCSrcJ = 0
+
         if control_signals["jump"]:
             self.PCSrcJ = 1
             self.Forward_AddrJ = jAddress
-            
+            if not stall:
+                self.IF_ID.flush()
         return {
             "EXL": EXL,
             "UM": UM,
@@ -364,6 +432,8 @@ class Pipelined_CPUCore:
 
         self.Hazard_Detection_Unit.id_ex_rt = rt_index
         self.Hazard_Detection_Unit.id_ex_MemRead = MEM_signals["mem_read"]
+        self.Hazard_Detection_Unit.id_ex_RegWrite = WB_signals["reg_write"]
+
         FW_A, FW_B = self.Forwarding_unit.determine_forwarding_paths(rs_index, rt_index)
         # print(f"Forwarding A: {FW_A}, Forwarding B: {FW_B}, rData1: {rs_index}:{rData1}, rData2: {rt_index}:{rData2}")
         if FW_A == 2:
@@ -375,6 +445,7 @@ class Pipelined_CPUCore:
             rData2 = alu_inputB
         elif FW_B == 1:
             alu_inputB = self.Forward_MEM_WB_data
+            rData2 = alu_inputB
         if EX_signals["alu_src"]:  #alu_src multiplexor
             alu_inputB = immt  # immediate value
         result, zero_flag, self.overflow = self.alu.execute(alu_inputA, alu_inputB, get_bits(immt, 0, 5), EX_signals["alu_op"])
@@ -416,6 +487,9 @@ class Pipelined_CPUCore:
         regd = ex_info["regd"]
         pc = ex_info["pc"]
 
+
+        self.Hazard_Detection_Unit.ex_mem_MemRead = MEM_signals["mem_read"]
+        self.Hazard_Detection_Unit.ex_mem_RegWrite = WB_signals["reg_write"]
         self.Forward_EX_MEM_data = result
         self.Forwarding_unit.ex_mem_RegWrite = WB_signals["reg_write"]
         self.Forwarding_unit.ex_mem_RegDst = regd
@@ -463,6 +537,7 @@ class Pipelined_CPUCore:
         self.Forwarding_unit.mem_wb_RegWrite = WB_signals["reg_write"]
         self.Forwarding_unit.mem_wb_RegDst = regd
         self.Forwarding_unit.mem_wb_MemRead = mem_read
+        self.Forward_MEM_WB_data_for_branch = result
         if WB_signals["mem_to_reg"]:
             print(f"Memory read: {bin(rMData)} from address {hex(result)}")
             result = rMData
@@ -856,6 +931,7 @@ class Compiler:
             'slt':  (0b000000, 0b101010, 'R'),
             'sll':  (0b000000, 0b000000, 'R'),
             'syscall': (0b000000, 0b001100, 'R'),
+            'nop': (0b000000, 0b000000, 'R'),
 
             'addi': (0b001000, 0b000000, 'I'),
             'lw':   (0b100011, 0b000000, 'I'),
@@ -870,6 +946,8 @@ class Compiler:
         if len(cmd) < 4:
             if cmd[0] == 'syscall':
                 return 0x0000000C # SYSCALL
+            elif cmd[0] == 'nop':
+                return self.nop # NOP: 0x00000000
             self.exception = "Invalid R-type instruction format"
             bin_code = self.nop
             return bin_code
@@ -1302,18 +1380,37 @@ sw $s2, -4($sp)
 lw $s3, -4($sp)
 add $s4, $zero, $s3
 """   
-#     code = """
-# addi $s1, $zero, 0
-# addi $s0, $zero, 5
-# addi $t0, $zero, 0
-# check:
-# slt $t2, $t0, $s0
-# beq $t2, $zero, end_check
-# addi $t0, $t0, 1
-# add $s1, $s1, $s0
-# j check
-# end_check:
-# """
+    code = """
+addi $s1, $zero, 0
+addi $s0, $zero, 5
+addi $t0, $zero, 0
+check:
+slt $t2, $t0, $s0
+beq $t2, $zero, end_check
+addi $t0, $t0, 1
+add $s1, $s1, $s0
+j check
+end_check:
+"""
+    code = """
+addi $t1, $zero, 999
+nop
+nop
+nop
+
+add $t0, $t1, $t2 
+nop
+sw  $t0, 0($sp)
+
+lw $t3, 0($sp)
+slt $t4, $zero, $t3
+beq $t4, $zero, end_beq
+addi $t5, $zero, 455
+addi $t6, $zero, 455
+end_beq:
+
+"""
+
 
     program = []
     print("Welcome to the command line interface. Type 'exit' to quit.")
